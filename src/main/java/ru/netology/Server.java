@@ -3,26 +3,24 @@ package ru.netology;
 import java.io.*;
 import java.net.ServerSocket;
 import java.net.Socket;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.time.LocalDateTime;
-import java.util.List;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 public class Server {
 
-    private final int port;
     private final ExecutorService threadPool;
-    private final List<String> validPaths;
+    private final Map<String, Map<String, Handler>> handlers;
 
-    public Server(int threadPoolSize, List<String> validPaths, int port) {
+    public Server(int threadPoolSize) {
         this.threadPool = Executors.newFixedThreadPool(threadPoolSize);
-        this.validPaths = validPaths;
-        this.port = port;
+        this.handlers = new ConcurrentHashMap<>();
     }
 
-    public void run() {
+    public void listen(int port) {
         try (final var socket = new ServerSocket(port)) {
             while (true) {
                 final var clientRequest = socket.accept();
@@ -33,27 +31,29 @@ public class Server {
         }
     }
 
+    public void addHandler(String methodType, String path, Handler handler) {
+        handlers.computeIfAbsent(methodType.toUpperCase(), k -> new ConcurrentHashMap<>())
+                .put(path, handler);
+    }
+
     private void executeRequest(Socket socket) {
         try (final var in = new BufferedReader(new InputStreamReader(socket.getInputStream()));
              final var out = new BufferedOutputStream(socket.getOutputStream());
         ) {
-            final var requestParts = processRequest(in);
-
-            if (requestParts.length != 3) {
-                return;
-            }
-
-            final var path = requestParts[1];
-
-            if (!validPaths.contains(path)) {
+            Request request = parseRequest(in);
+            if (request == null) {
                 sendInvalidPathError(out);
                 return;
             }
 
-            final var filePath = Path.of(".", "public", path);
-            final var mimeType = Files.probeContentType(filePath);
+            Handler handler = handlers.getOrDefault(request.getMethod(), Collections.emptyMap())
+                    .get(request.getPath());
+            if (handler == null) {
+                sendInvalidPathError(out);
+                return;
+            }
 
-            sendResponse(out, filePath, mimeType, path);
+            handler.handle(request, out);
         } catch (IOException e) {
             e.printStackTrace();
         } finally {
@@ -65,22 +65,38 @@ public class Server {
         }
     }
 
-    private String[] processRequest(BufferedReader in) throws IOException {
-        return in.readLine().split(" ");
+    private Request parseRequest(BufferedReader in) throws IOException {
+        final var requestParts = processRequest(in);
+
+        if (requestParts.length != 3) {
+            return null;
+        }
+
+        final var method = requestParts[0];
+        final var path = requestParts[1];
+
+        Map<String, String> headers = new HashMap<>();
+        String line;
+        while ((line = in.readLine()) != null && !line.isBlank()) {
+            final var headerParts = line.split(": ", 2);
+            if (headerParts.length == 2) {
+                headers.put(headerParts[0], headerParts[1]);
+            }
+        }
+
+        InputStream body = new ByteArrayInputStream(new byte[0]);
+        if (headers.containsKey("Content-Length")) {
+            int contentLength = Integer.parseInt(headers.get("Content-Length"));
+            char[] bodyChars = new char[contentLength];
+            in.read(bodyChars, 0, contentLength);
+            body = new ByteArrayInputStream(new String(bodyChars).getBytes());
+        }
+
+        return new Request(method, path, headers, body);
     }
 
-    private void sendResponse(BufferedOutputStream out, Path filePath, String mimeType, String path) throws IOException {
-        if (path.equals("/classic.html")) {
-            final var template = Files.readString(filePath);
-            final var content = template.replace(
-                    "{time}",
-                    LocalDateTime.now().toString()
-            ).getBytes();
-            prepareResponse(out, mimeType, content.length, content);
-        } else {
-            final var length = Files.size(filePath);
-            prepareResponse(out, mimeType, length, filePath);
-        }
+    private String[] processRequest(BufferedReader in) throws IOException {
+        return in.readLine().split(" ");
     }
 
     private void sendInvalidPathError(OutputStream out) throws IOException {
@@ -90,29 +106,6 @@ public class Server {
                         "Connection: close\r\n" +
                         "\r\n"
         ).getBytes());
-        out.flush();
-    }
-
-    private String prepareHeaders(String contentType, long contentLength){
-        return String.format(
-                "HTTP/1.1 200 OK\r\n" +
-                        "Content-Type: %s\r\n" +
-                        "Content-Length: %d\r\n" +
-                        "Connection: close\r\n" +
-                        "\r\n",
-                contentType, contentLength
-        );
-    }
-
-    private void prepareResponse(BufferedOutputStream out, String contentType, long contentLength, Path filePath) throws IOException {
-        out.write(prepareHeaders(contentType, contentLength).getBytes());
-        Files.copy(filePath, out);
-        out.flush();
-    }
-
-    private void prepareResponse(BufferedOutputStream out, String contentType, long contentLength, byte[] content) throws IOException {
-        out.write(prepareHeaders(contentType, contentLength).getBytes());
-        out.write(content);
         out.flush();
     }
 }
